@@ -1,3 +1,4 @@
+import { NeteaseLogin, ownerAuthorized } from "./neteaseLogin.js";
 import { randomUUID } from "node:crypto";
 import { chmodSync, existsSync, unlinkSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
@@ -35,7 +36,16 @@ function enqueueTogetherEvent(
   return created;
 }
 
-const togetherWorker = createTogetherWorker(enqueueTogetherEvent, playbackState);
+let togetherWorker = createTogetherWorker(enqueueTogetherEvent, playbackState);
+
+const OWNER_KEY = process.env.COVE_ACCESS_KEY ?? "";
+const login = new NeteaseLogin((cookie) => {
+  if (togetherWorker.getStatus().enabled) throw new Error("account_already_configured");
+  process.env.NETEASE_COOKIE = cookie;
+  process.env.TOGETHER_ENABLED = "true";
+  togetherWorker = createTogetherWorker(enqueueTogetherEvent, playbackState);
+  togetherWorker.start();
+});
 
 const eventInput = z.object({
   eventId: z.string().trim().min(1).max(200).optional(),
@@ -62,7 +72,7 @@ async function readJson(req: IncomingMessage): Promise<unknown> {
 }
 
 function authorized(req: IncomingMessage): boolean {
-  return !INGEST_TOKEN || req.headers.authorization === `Bearer ${INGEST_TOKEN}`;
+  return OWNER_KEY ? ownerAuthorized(req.headers.authorization, OWNER_KEY) : (!INGEST_TOKEN || req.headers.authorization === `Bearer ${INGEST_TOKEN}`);
 }
 
 export function createHttpServer() {
@@ -134,11 +144,37 @@ export function createHttpServer() {
       return;
     }
 
+    if (url.pathname.startsWith("/admin/login/")) {
+      res.setHeader("Cache-Control", "no-store");
+      if (!ownerAuthorized(req.headers.authorization, OWNER_KEY)) {
+        writeJson(res, 401, { error: "unauthorized" });
+        return;
+      }
+      if (req.method !== "POST") { writeJson(res, 405, { error: "method_not_allowed" }); return; }
+      try {
+        if (url.pathname === "/admin/login/start") {
+          writeJson(res, 200, await login.start());
+        } else if (url.pathname === "/admin/login/check") {
+          const body = await readJson(req) as { session?: unknown };
+          writeJson(res, 200, await login.check(typeof body.session === "string" ? body.session : ""));
+        } else { writeJson(res, 404, { error: "not_found" }); }
+      } catch {
+        // Never relay provider errors or response headers/cookies to the client or logs.
+        writeJson(res, 502, { error: "netease_login_unavailable" });
+      }
+      return;
+    }
+
     const mcpMethods = new Set(["POST", "GET", "DELETE"]);
     const mcpProfile = MCP_PATHS.get(url.pathname);
     if (mcpProfile && mcpMethods.has(req.method)) {
       res.setHeader("Access-Control-Allow-Origin", "*");
       res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id");
+      if (OWNER_KEY && !ownerAuthorized(req.headers.authorization, OWNER_KEY)) {
+        res.setHeader("WWW-Authenticate", 'Bearer realm="cove-resonance"');
+        writeJson(res, 401, { error: "unauthorized" });
+        return;
+      }
       const server = createMcpServer(queue, playbackState, togetherWorker, mcpProfile);
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: undefined,
