@@ -1,5 +1,6 @@
 import { NeteaseLogin, ownerAuthorized } from "./neteaseLogin.js";
-import { randomUUID } from "node:crypto";
+import { loginPage } from "./loginPage.js";
+import { randomBytes, randomUUID } from "node:crypto";
 import { chmodSync, existsSync, unlinkSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -39,6 +40,7 @@ function enqueueTogetherEvent(
 let togetherWorker = createTogetherWorker(enqueueTogetherEvent, playbackState);
 
 const OWNER_KEY = process.env.COVE_ACCESS_KEY ?? "";
+const LOGIN_KEY = process.env.COVE_LOGIN_KEY ?? "";
 const login = new NeteaseLogin((cookie) => {
   if (togetherWorker.getStatus().enabled) throw new Error("account_already_configured");
   process.env.NETEASE_COOKIE = cookie;
@@ -105,6 +107,16 @@ export function createHttpServer() {
       return;
     }
 
+    if (req.method === "GET" && url.pathname === "/login") {
+      const nonce = randomBytes(18).toString("base64");
+      res.writeHead(200, {
+        "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store",
+        "Referrer-Policy": "no-referrer", "X-Content-Type-Options": "nosniff",
+        "Content-Security-Policy": `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`,
+      });
+      res.end(loginPage(nonce)); return;
+    }
+
     if (req.method === "GET" && url.pathname === "/listener/events") {
       const authorization = req.headers.authorization ?? "";
       const bearerToken = authorization.startsWith("Bearer ")
@@ -146,9 +158,12 @@ export function createHttpServer() {
 
     if (url.pathname.startsWith("/admin/login/")) {
       res.setHeader("Cache-Control", "no-store");
-      if (!ownerAuthorized(req.headers.authorization, OWNER_KEY)) {
+      if (!ownerAuthorized(req.headers.authorization, OWNER_KEY) && !ownerAuthorized(req.headers.authorization, LOGIN_KEY)) {
         writeJson(res, 401, { error: "unauthorized" });
         return;
+      }
+      if (req.headers.origin && req.headers.origin !== process.env.BRIDGE_PUBLIC_ORIGIN) {
+        writeJson(res, 403, { error: "origin_rejected" }); return;
       }
       if (req.method !== "POST") { writeJson(res, 405, { error: "method_not_allowed" }); return; }
       try {
@@ -157,8 +172,19 @@ export function createHttpServer() {
         } else if (url.pathname === "/admin/login/check") {
           const body = await readJson(req) as { session?: unknown };
           writeJson(res, 200, await login.check(typeof body.session === "string" ? body.session : ""));
+        } else if (url.pathname === "/admin/login/sms/send") {
+          const b = await readJson(req) as Record<string, unknown>;
+          writeJson(res, 200, await login.sendSms(b.phone, b.country));
+        } else if (url.pathname === "/admin/login/sms/confirm") {
+          const b = await readJson(req) as Record<string, unknown>;
+          writeJson(res, 200, await login.loginSms(b.phone, b.country, b.captcha));
+        } else if (url.pathname === "/admin/login/status") {
+          writeJson(res, 200, login.status());
         } else { writeJson(res, 404, { error: "not_found" }); }
-      } catch {
+      } catch (error) {
+        const name = error instanceof Error ? error.message : "";
+        const safeErrors = ["sms_rate_limited", "sms_session_expired", "sms_attempts_exceeded", "invalid_phone", "invalid_captcha", "login_busy"];
+        if (safeErrors.includes(name)) { writeJson(res, name === "sms_rate_limited" ? 429 : 400, { error: name }); return; }
         // Never relay provider errors or response headers/cookies to the client or logs.
         writeJson(res, 502, { error: "netease_login_unavailable" });
       }
