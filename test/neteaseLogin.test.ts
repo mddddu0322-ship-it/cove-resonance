@@ -77,3 +77,20 @@ test('failed SMS send consumes cooldown and does not permit confirmation', async
   await assert.rejects(login.sendSms('15500000000','86'),/sms_rate_limited/);
   await assert.rejects(login.loginSms('15500000000','86','123456'),/sms_session_expired/);
 });
+
+test('SDK security rejection preserves code, hides sensitive fields and ends SMS session', async()=>{
+  let confirmations=0;
+  const login=new NeteaseLogin(()=>{assert.fail('must not connect');},{
+    captcha_sent:async()=>({body:{code:200}}),
+    login_cellphone:async()=>{confirmations++;throw {status:400,body:{code:10004,message:'private provider details',cookie:'MUSIC_U=private'},cookie:['private']};},
+  });
+  await login.sendSms('15500000000','86');
+  assert.deepEqual(await login.loginSms('15500000000','86','123456'),{loggedIn:false,code:10004,reason:'security_check'});
+  await assert.rejects(login.loginSms('15500000000','86','123456'),/sms_session_expired/);
+  assert.equal(confirmations,1);
+});
+
+test('SMS transport failure does not claim captcha was incorrect',async()=>{
+  const login=new NeteaseLogin(()=>{}, {captcha_sent:async()=>{throw new Error('private network details');}});
+  assert.deepEqual(await login.sendSms('15500000000','86'),{sent:false,code:502,reason:'upstream_unavailable'});
+});
