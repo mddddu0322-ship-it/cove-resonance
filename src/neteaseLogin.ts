@@ -6,6 +6,15 @@ type Api = Record<string, (args: Record<string, unknown>) => Promise<Result>>;
 const require = createRequire(import.meta.url);
 const api = require('NeteaseCloudMusicApi') as Api;
 
+// The SDK rejects non-200 provider replies. Only expose a numeric code and a
+// fixed reason; its raw error may contain account data or session cookies.
+function loginFailure(result: unknown) {
+  const value = Number((result as Result | undefined)?.body?.code);
+  const code = Number.isInteger(value) && value > 0 ? value : 502;
+  const reason = code === 10004 ? 'security_check' : code === 502 ? 'upstream_unavailable' : 'login_rejected';
+  return { code, reason };
+}
+
 export function ownerAuthorized(header: string | undefined, key: string): boolean {
   if (key.length < 32 || !header?.startsWith('Bearer ')) return false;
   const actual = Buffer.from(header.slice(7));
@@ -38,10 +47,10 @@ export class NeteaseLogin {
     try {
       const result = await this.sdk.captcha_sent({ phone: input.phone, ctcode: input.country });
       const code = Number(result.body?.code);
-      if (code !== 200) return { sent: false, code: Number.isFinite(code) ? code : 502 };
+      if (code !== 200) return { sent: false, ...loginFailure(result) };
       this.sms = { ...input, expires: now + 300_000, attempts: 0 };
       return { sent: true, retryAfter: 60 };
-    } catch { return { sent: false, code: 502 }; }
+    } catch (error) { return { sent: false, ...loginFailure(error) }; }
     finally { this.busy = false; }
   }
   async loginSms(phone: unknown, country: unknown, captcha: unknown) {
@@ -56,9 +65,17 @@ export class NeteaseLogin {
     try {
       let result: Result;
       try { result = await this.sdk.login_cellphone({ phone: input.phone, countrycode: input.country, captcha }); }
-      catch { return { loggedIn: false, code: 502 }; }
+      catch (error) {
+        const failure = loginFailure(error);
+        if (failure.reason === 'security_check') this.sms = null;
+        return { loggedIn: false, ...failure };
+      }
       const code = Number(result.body?.code);
-      if (code !== 200) return { loggedIn: false, code: Number.isFinite(code) ? code : 502 };
+      if (code !== 200) {
+        const failure = loginFailure(result);
+        if (failure.reason === 'security_check') this.sms = null;
+        return { loggedIn: false, ...failure };
+      }
       const connected = await this.acceptCookie(result);
       this.sms = null;
       return connected;
